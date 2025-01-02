@@ -1397,15 +1397,21 @@ impl Bucket {
     /// # }
     /// ```
     #[maybe_async::async_impl]
-    pub async fn put_object_stream<R: AsyncRead + Unpin + ?Sized>(
+    pub async fn put_object_stream<R, F>(
         &self,
         reader: &mut R,
         s3_path: impl AsRef<str>,
-    ) -> Result<PutStreamResponse, S3Error> {
+        progress_callback: Option<F>,
+    ) -> Result<PutStreamResponse, S3Error>
+    where
+        R: AsyncRead + Unpin + ?Sized,
+        F: Fn(u64, u64) + Send + Sync + 'static,
+    {
         self._put_object_stream_with_content_type(
             reader,
             s3_path.as_ref(),
             "application/octet-stream",
+            progress_callback,
         )
         .await
     }
@@ -1473,15 +1479,26 @@ impl Bucket {
     /// # Ok(())
     /// # }
     /// ```
+
     #[maybe_async::async_impl]
-    pub async fn put_object_stream_with_content_type<R: AsyncRead + Unpin>(
+    pub async fn put_object_stream_with_content_type<R, F>(
         &self,
         reader: &mut R,
         s3_path: impl AsRef<str>,
         content_type: impl AsRef<str>,
-    ) -> Result<PutStreamResponse, S3Error> {
-        self._put_object_stream_with_content_type(reader, s3_path.as_ref(), content_type.as_ref())
-            .await
+        progress_callback: Option<F>,
+    ) -> Result<PutStreamResponse, S3Error>
+    where
+        R: AsyncRead + Unpin,
+        F: Fn(u64, u64) + Send + Sync + 'static,
+    {
+        self._put_object_stream_with_content_type(
+            reader,
+            s3_path.as_ref(),
+            content_type.as_ref(),
+            progress_callback,
+        )
+        .await
     }
 
     #[maybe_async::sync_impl]
@@ -1513,21 +1530,32 @@ impl Bucket {
     }
 
     #[maybe_async::async_impl]
-    async fn _put_object_stream_with_content_type<R: AsyncRead + Unpin + ?Sized>(
+    async fn _put_object_stream_with_content_type<R: AsyncRead + Unpin + ?Sized, F>(
         &self,
         reader: &mut R,
         s3_path: &str,
         content_type: &str,
-    ) -> Result<PutStreamResponse, S3Error> {
-        // If the file is smaller CHUNK_SIZE, just do a regular upload.
-        // Otherwise perform a multi-part upload.
+        progress_callback: Option<F>,
+    ) -> Result<PutStreamResponse, S3Error>
+    where
+        F: Fn(u64, u64) + Send + Sync + 'static,
+    {
         let first_chunk = crate::utils::read_chunk_async(reader).await?;
-        // println!("First chunk size: {}", first_chunk.len());
+
         if first_chunk.len() < CHUNK_SIZE {
             let total_size = first_chunk.len();
+            if let Some(callback) = &progress_callback {
+                callback(0, total_size as u64);
+            }
+
             let response_data = self
                 .put_object_with_content_type(s3_path, first_chunk.as_slice(), content_type)
                 .await?;
+
+            if let Some(callback) = &progress_callback {
+                callback(total_size as u64, total_size as u64);
+            }
+
             if response_data.status_code() >= 300 {
                 return Err(error_from_response_data(response_data)?);
             }
@@ -1545,10 +1573,10 @@ impl Bucket {
 
         let mut part_number: u32 = 0;
         let mut etags = Vec::new();
+        let mut uploaded_size: u64 = 0;
+        let mut total_size: usize = 0;
 
-        // Collect request handles
         let mut handles = vec![];
-        let mut total_size = 0;
         loop {
             let chunk = if part_number == 0 {
                 first_chunk.clone()
@@ -1559,7 +1587,6 @@ impl Bucket {
 
             let done = chunk.len() < CHUNK_SIZE;
 
-            // Start chunk upload
             part_number += 1;
             handles.push(self.make_multipart_request(
                 &path,
@@ -1574,13 +1601,10 @@ impl Bucket {
             }
         }
 
-        // Wait for all chunks to finish (or fail)
-        let responses = futures::future::join_all(handles).await;
-
-        for response in responses {
+        let chunk_size = CHUNK_SIZE as u64;
+        for response in futures::future::join_all(handles).await {
             let response_data = response?;
             if !(200..300).contains(&response_data.status_code()) {
-                // if chunk upload failed - abort the upload
                 match self.abort_upload(&path, upload_id).await {
                     Ok(_) => {
                         return Err(error_from_response_data(response_data)?);
@@ -1591,11 +1615,15 @@ impl Bucket {
                 }
             }
 
+            uploaded_size += chunk_size;
+            if let Some(callback) = &progress_callback {
+                callback(uploaded_size, total_size as u64);
+            }
+
             let etag = response_data.as_str()?;
             etags.push(etag.to_string());
         }
 
-        // Finish the upload
         let inner_data = etags
             .clone()
             .into_iter()
@@ -1605,9 +1633,14 @@ impl Bucket {
                 part_number: i as u32 + 1,
             })
             .collect::<Vec<Part>>();
+
         let response_data = self
             .complete_multipart_upload(&path, &msg.upload_id, inner_data)
             .await?;
+
+        if let Some(callback) = &progress_callback {
+            callback(total_size as u64, total_size as u64);
+        }
 
         Ok(PutStreamResponse::new(
             response_data.status_code(),
@@ -3037,7 +3070,7 @@ mod test {
         let mut reader = File::open(local_path).await.unwrap();
 
         let response = bucket
-            .put_object_stream(&mut reader, remote_path)
+            .put_object_stream(&mut reader, remote_path, None::<fn(u64, u64)>)
             .await
             .unwrap();
         #[cfg(not(feature = "sync"))]
@@ -3143,7 +3176,7 @@ mod test {
         let mut reader = std::io::Cursor::new(&content);
 
         let response = bucket
-            .put_object_stream(&mut reader, remote_path)
+            .put_object_stream(&mut reader, remote_path, None::<fn(u64, u64)>)
             .await
             .unwrap();
         #[cfg(not(feature = "sync"))]
